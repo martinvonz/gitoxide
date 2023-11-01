@@ -141,6 +141,7 @@ pub mod rewrites {
 
         use gix_diff::tree::visit::Change;
         use gix_object::tree::EntryMode;
+        use gix_object::FindExt;
 
         use crate::diff::blob::DiffLineStats;
         use crate::diff::{rewrites::Tracker, Rewrites};
@@ -249,7 +250,7 @@ pub mod rewrites {
             #[allow(missing_docs)]
             pub enum Error {
                 #[error("Could not find blob for similarity checking")]
-                FindExistingBlob(#[source] Box<dyn std::error::Error + Send + Sync>),
+                FindExistingBlob(#[from] gix_object::find::existing_object::Error),
                 #[error("Could not obtain exhaustive item set to use as possible sources for copy detection")]
                 GetItemsForExhaustiveCopyDetection(#[source] Box<dyn std::error::Error + Send + Sync>),
             }
@@ -303,23 +304,20 @@ pub mod rewrites {
             /// `cb(destination, source)` is called for each item, either with `Some(source)` if it's
             /// the destination of a copy or rename, or with `None` for source if no relation to other
             /// items in the tracked set exist.
-            /// `find_blob(oid, buf) -> Result<BlobRef, E>` is used to access blob data for similarity checks
-            /// if required with data and is taken directly from the object database. Worktree filters and diff conversions
-            /// will be applied afterwards automatically.
+            /// `objects` is used to access blob data for similarity checks if required and is taken directly from the object database.
+            /// Worktree filters and diff conversions will be applied afterwards automatically.
             /// `push_source_tree(push_fn: push(change, location))` is a function that is called when the entire tree of the source
             /// should be added as modifications by calling `push` repeatedly to use for perfect copy tracking. Note that
             /// `push` will panic if `change` is not a modification, and it's valid to not call `push` at all.
-            pub fn emit<FindFn, E1, PushSourceTreeFn, E2>(
+            pub fn emit<PushSourceTreeFn, E>(
                 &mut self,
                 mut cb: impl FnMut(visit::Destination<'_>, Option<visit::Source<'_>>) -> gix_diff::tree::visit::Action,
-                mut find_blob: FindFn,
+                objects: impl gix_object::Find,
                 mut push_source_tree: PushSourceTreeFn,
             ) -> Result<Outcome, emit::Error>
             where
-                FindFn: for<'b> FnMut(&gix_hash::oid, &'b mut Vec<u8>) -> Result<gix_object::BlobRef<'b>, E1>,
-                PushSourceTreeFn: FnMut(&mut dyn FnMut(Change, &BStr)) -> Result<(), E2>,
-                E1: std::error::Error + Send + Sync + 'static,
-                E2: std::error::Error + Send + Sync + 'static,
+                PushSourceTreeFn: FnMut(&mut dyn FnMut(Change, &BStr)) -> Result<(), E>,
+                E: std::error::Error + Send + Sync + 'static,
             {
                 fn by_id_and_location(a: &Item, b: &Item) -> std::cmp::Ordering {
                     a.change
@@ -338,7 +336,7 @@ pub mod rewrites {
                     &mut cb,
                     self.rewrites.percentage,
                     out,
-                    &mut find_blob,
+                    &objects,
                 )?;
 
                 if let Some(copies) = self.rewrites.copies {
@@ -347,7 +345,7 @@ pub mod rewrites {
                         &mut cb,
                         copies.percentage,
                         out,
-                        &mut find_blob,
+                        &objects,
                     )?;
 
                     match copies.source {
@@ -369,7 +367,7 @@ pub mod rewrites {
                                 &mut cb,
                                 copies.percentage,
                                 out,
-                                &mut find_blob,
+                                &objects,
                             )?;
                         }
                     }
@@ -392,21 +390,17 @@ pub mod rewrites {
                 Ok(out)
             }
 
-            fn match_pairs_of_kind<FindFn, E>(
+            fn match_pairs_of_kind(
                 &mut self,
                 kind: visit::Kind,
                 cb: &mut impl FnMut(visit::Destination<'_>, Option<visit::Source<'_>>) -> gix_diff::tree::visit::Action,
                 percentage: Option<f32>,
                 mut out: Outcome,
-                mut find_blob: FindFn,
-            ) -> Result<Outcome, emit::Error>
-            where
-                FindFn: for<'b> FnMut(&gix_hash::oid, &'b mut Vec<u8>) -> Result<gix_object::BlobRef<'b>, E>,
-                E: std::error::Error + Send + Sync + 'static,
-            {
+                objects: impl gix_object::Find,
+            ) -> Result<Outcome, emit::Error> {
                 // we try to cheaply reduce the set of possibilities first, before possibly looking more exhaustively.
                 let needs_second_pass = !needs_exact_match(percentage);
-                if self.match_pairs(cb, None /* by identity */, kind, &mut out, &mut find_blob)?
+                if self.match_pairs(cb, None /* by identity */, kind, &mut out, &objects)?
                     == gix_diff::tree::visit::Action::Cancel
                 {
                     return Ok(out);
@@ -428,24 +422,20 @@ pub mod rewrites {
                         false
                     };
                     if !is_limited {
-                        self.match_pairs(cb, percentage, kind, &mut out, &mut find_blob)?;
+                        self.match_pairs(cb, percentage, kind, &mut out, &objects)?;
                     }
                 }
                 Ok(out)
             }
 
-            fn match_pairs<FindFn, E>(
+            fn match_pairs(
                 &mut self,
                 cb: &mut impl FnMut(visit::Destination<'_>, Option<visit::Source<'_>>) -> gix_diff::tree::visit::Action,
                 percentage: Option<f32>,
                 kind: visit::Kind,
                 stats: &mut Outcome,
-                mut find_blob: FindFn,
-            ) -> Result<gix_diff::tree::visit::Action, emit::Error>
-            where
-                FindFn: for<'b> FnMut(&gix_hash::oid, &'b mut Vec<u8>) -> Result<gix_object::BlobRef<'b>, E>,
-                E: std::error::Error + Send + Sync + 'static,
-            {
+                objects: impl gix_object::Find,
+            ) -> Result<gix_diff::tree::visit::Action, emit::Error> {
                 // TODO(perf): reuse object data and interner state and interned tokens, make these available to `find_match()`
                 let mut dest_ofs = 0;
                 while let Some((mut dest_idx, dest)) =
@@ -462,7 +452,7 @@ pub mod rewrites {
                         percentage.map(|p| (p, self.diff_algo)),
                         kind,
                         stats,
-                        &mut find_blob,
+                        &objects,
                         &mut self.buf1,
                         &mut self.buf2,
                     )?
@@ -543,20 +533,19 @@ pub mod rewrites {
         /// Note that we always try to find by identity first even if a percentage is given as it's much faster and may reduce the set
         /// of items to be searched.
         #[allow(clippy::too_many_arguments)]
-        fn find_match<'a, FindFn, E>(
+        fn find_match<'a, Find>(
             items: &'a [Item],
             item: &Item,
             item_idx: usize,
             percentage: Option<(f32, gix_diff::blob::Algorithm)>,
             kind: visit::Kind,
             stats: &mut Outcome,
-            mut find_worktree_blob: FindFn,
+            objects: Find,
             buf1: &mut Vec<u8>,
             buf2: &mut Vec<u8>,
         ) -> Result<Option<SourceTuple<'a>>, emit::Error>
         where
-            FindFn: for<'b> FnMut(&gix_hash::oid, &'b mut Vec<u8>) -> Result<gix_object::BlobRef<'b>, E>,
-            E: std::error::Error + Send + Sync + 'static,
+            Find: gix_object::Find,
         {
             let (item_id, item_mode) = item.change.oid_and_entry_mode();
             if needs_exact_match(percentage.map(|t| t.0)) || item_mode == gix_object::tree::EntryMode::Link {
@@ -583,8 +572,7 @@ pub mod rewrites {
                     return Ok(Some(src));
                 }
             } else {
-                let new =
-                    find_worktree_blob(item_id, buf1).map_err(|err| emit::Error::FindExistingBlob(Box::new(err)))?;
+                let new = objects.find_blob(item_id, buf1)?;
                 let (percentage, algo) = percentage.expect("it's set to something below 1.0 and we assured this");
                 debug_assert!(
                     item.change.entry_mode().is_blob(),
@@ -595,8 +583,7 @@ pub mod rewrites {
                     .enumerate()
                     .filter(|(src_idx, src)| *src_idx != item_idx && src.is_source_for_destination_of(kind, item_mode))
                 {
-                    let old = find_worktree_blob(src.change.oid(), buf2)
-                        .map_err(|err| emit::Error::FindExistingBlob(Box::new(err)))?;
+                    let old = objects.find_blob(src.change.oid(), buf2)?;
                     // TODO: make sure we get attribute handling and binary skips and filters right here. There is crate::object::blob::diff::Platform
                     //       which should have facilities for that one day, but we don't use it because we need newlines in our tokens.
                     let tokens = gix_diff::blob::intern::InternedInput::new(

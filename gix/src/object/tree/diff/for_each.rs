@@ -174,7 +174,7 @@ where
                     &mut self.err,
                 ),
             },
-            |oid, buf| self.src_tree.repo.objects.find_blob(oid, buf),
+            &self.src_tree.repo.objects,
             |push| {
                 self.src_tree
                     .traverse()
